@@ -12,7 +12,8 @@
 contracts/src/
 ├── BlieverUmaAdapter.sol          ← Main adapter (UUPS proxy)
 ├── libraries/
-│   └── MultiValueDecoder.sol      ← UMIP-183 encode / decode library (pure)
+│   ├── MultiValueDecoder.sol      ← UMIP-183 encode / decode library (pure)
+│   └── AncillaryDataLib.sol       ← Initializer-append + gas-optimised address encoder (pure)
 ├── mixins/
 │   └── BulletinBoard.sol          ← On-chain update registry (Polymarket, unchanged)
 └── interfaces/
@@ -53,7 +54,8 @@ Slots 3–5 (32 bytes each):
   uint256 liveness
 
 Dynamic slot:
-  bytes   ancillaryData     — keccak256(ancillaryData) == questionId
+  bytes   ancillaryData     — fullAncillaryData: raw JSON ++ ",initializer:" ++ hex(factory)
+                              keccak256(ancillaryData) == questionId
 ```
 
 The `questions` mapping in `BlieverUmaAdapter` starts at storage slot determined by `AccessControlUpgradeable` + `PausableUpgradeable` + `UUPSUpgradeable` + `BulletinBoard` inheritance. The key point: `BulletinBoard.updates` occupies one mapping slot, and `optimisticOracle` + `questions` follow in declaration order.
@@ -97,7 +99,43 @@ Per UMIP-183: "to prevent misinterpretation prices should first be checked again
 
 ---
 
-## 3. `BulletinBoard` Mixin
+## 3. `AncillaryDataLib` Library
+
+**File:** `contracts/src/libraries/AncillaryDataLib.sol`  
+**Source:** UMA Protocol / Polymarket `uma-ctf-adapter` — pragma updated to 0.8.31.  
+**Type:** Pure library — no state, no external calls.
+
+### Purpose
+
+Appends a canonical `,initializer:<hex-address>` suffix to raw ancillary data bytes before they are hashed and submitted to the UMA Optimistic Oracle. This attributes each market to the factory address on the UMA DVM voter UI, allowing voters to distinguish protocol-sanctioned markets from spam.
+
+### `_appendAncillaryData(address initializer, bytes memory ancillaryData) → bytes memory`
+
+Returns `abi.encodePacked(ancillaryData, ",initializer:", _toUtf8BytesAddress(initializer))`.
+
+The returned bytes are what the adapter stores in `qd.ancillaryData` and submits to the OO. All downstream operations — `_requestPrice`, `_resetQuestion`, `_hasPrice`, `_decodeAndResolve`, and the `priceDisputed` callback — operate on this full form.
+
+### `_toUtf8BytesAddress(address addr) → bytes memory`
+
+Converts a 20-byte address to a 40-character lower-case hex ASCII string (no `0x` prefix), producing 40 bytes total. Delegates to `_toUtf8Bytes32Bottom` for bit-manipulation hex encoding.
+
+### `_toUtf8Bytes32Bottom(bytes32 bytesIn) → bytes32` (private)
+
+Gas-optimised nibble interleave + hex encode operating entirely in `uint256` arithmetic inside an `unchecked` block. Sourced from the UMA Protocol repository and used verbatim by Polymarket. Encoding cost is approximately 500 gas per byte versus ~2 500 gas for a naive string-conversion loop.
+
+### Suffix length
+
+| Component | Bytes |
+|---|---|
+| `,initializer:` prefix | 13 |
+| Lower-case hex address (no `0x`) | 40 |
+| **Total suffix** | **53** |
+
+This is the value of `INITIALIZER_SUFFIX_LENGTH` in the adapter.
+
+---
+
+## 4. `BulletinBoard` Mixin
 
 **File:** `contracts/src/mixins/BulletinBoard.sol`  
 **Source:** Polymarket's `uma-ctf-adapter` — core logic unchanged, pragma updated 0.8.15 → 0.8.31.
@@ -110,9 +148,9 @@ Storage: one mapping `updates[keccak256(abi.encode(questionID, poster))] → Anc
 
 ---
 
-## 4. `BlieverUmaAdapter` — Function-by-Function
+## 5. `BlieverUmaAdapter` — Function-by-Function
 
-### 4.1 `initialize(optimisticOracle, admin, factory, emergency)`
+### 5.1 `initialize(optimisticOracle, admin, factory, emergency)`
 
 - Calls `__AccessControl_init()`, `__Pausable_init()`, `__UUPSUpgradeable_init()`.
 - Grants `DEFAULT_ADMIN_ROLE`, `FACTORY_ROLE`, `EMERGENCY_ROLE` to the provided addresses.
@@ -121,7 +159,7 @@ Storage: one mapping `updates[keccak256(abi.encode(questionID, poster))] → Anc
 
 ---
 
-### 4.2 `initializeQuestion(questionId, market, ancillaryData, rewardToken, reward, proposalBond, liveness)`
+### 5.2 `initializeQuestion(questionId, market, ancillaryData, rewardToken, reward, proposalBond, liveness)`
 
 **Access:** `FACTORY_ROLE` + `whenNotPaused`  
 **Reentrancy:** `nonReentrant`
@@ -129,16 +167,20 @@ Storage: one mapping `updates[keccak256(abi.encode(questionID, poster))] → Anc
 **Validation sequence:**
 ```
 market != address(0) && rewardToken != address(0)
-ancillaryData.length ∈ [1, MAX_ANCILLARY_DATA]
-keccak256(ancillaryData) == questionId           ← off-chain / on-chain consistency
+ancillaryData.length ∈ [1, MAX_ANCILLARY_DATA − INITIALIZER_SUFFIX_LENGTH]
+                                                 ← raw bytes must leave room for 53-byte suffix
+fullAncillaryData = AncillaryDataLib._appendAncillaryData(msg.sender, ancillaryData)
+keccak256(fullAncillaryData) == questionId       ← off-chain / on-chain consistency
 market.questionId() == questionId                ← correct market bound to adapter
 !_isInitialized(questions[questionId])           ← no duplicate registration
 market.outcomeCount() ∈ [2, MAX_OUTCOMES]        ← V1 cap
 ```
 
 **Then:**
-1. Writes full `QuestionData` to `questions[questionId]` (single SSTORE batch).
-2. Calls `_requestPrice(msg.sender, requestTimestamp, …)` which:
+1. Computes `fullAncillaryData = AncillaryDataLib._appendAncillaryData(msg.sender, ancillaryData)`,
+   appending `,initializer:<lower-case-hex-address>` to attribute the market to its factory on the UMA DVM voter UI.
+2. Writes full `QuestionData` to `questions[questionId]` (single SSTORE batch), storing `fullAncillaryData`.
+3. Calls `_requestPrice(msg.sender, requestTimestamp, fullAncillaryData, …)` which:
    - Pulls `reward` from factory → adapter via `safeTransferFrom` if `reward > 0`.
    - Approves OO for `type(uint256).max` if current allowance < reward.
    - Calls `OO.requestPrice(MULTIPLE_VALUES, …)`.
@@ -149,7 +191,7 @@ market.outcomeCount() ∈ [2, MAX_OUTCOMES]        ← V1 cap
 
 ---
 
-### 4.3 `resolve(questionId)` — Permissionless
+### 5.3 `resolve(questionId)` — Permissionless
 
 **Access:** public + `whenNotPaused`  
 **Reentrancy:** `nonReentrant`
@@ -168,6 +210,7 @@ Delegates to `_decodeAndResolve(questionId, qd)`.
 **`_decodeAndResolve` internals:**
 ```
 int256 encodedPrice = OO.settleAndGetPrice(MULTIPLE_VALUES, qd.requestTimestamp, qd.ancillaryData)
+// qd.ancillaryData is fullAncillaryData (raw JSON ++ initializer suffix) — matches the OO request key
 
 if isTooEarly(encodedPrice):
     _resetQuestion(address(this), questionId, true, qd)
@@ -196,12 +239,13 @@ emit QuestionResolved
 
 ---
 
-### 4.4 `priceDisputed(identifier, timestamp, ancillaryData, refund)` — OO Callback
+### 5.4 `priceDisputed(identifier, timestamp, ancillaryData, refund)` — OO Callback
 
 **Access:** `onlyOptimisticOracle`
 
 ```
-bytes32 questionId = keccak256(ancillaryData)
+// ancillaryData echoed by the OO is fullAncillaryData (raw JSON ++ initializer suffix)
+bytes32 questionId = keccak256(ancillaryData)    // == keccak256(fullAncillaryData)
 QuestionData storage qd = questions[questionId]
 
 if qd.resolved:                    // Admin already resolved manually
@@ -220,7 +264,7 @@ _resetQuestion(address(this), questionId, false, qd)
 
 ---
 
-### 4.5 `flag(questionId)` + `unflag(questionId)` + `resolveManually(questionId, winningOutcome)`
+### 5.5 `flag(questionId)` + `unflag(questionId)` + `resolveManually(questionId, winningOutcome)`
 
 **Access:** `EMERGENCY_ROLE` + `nonReentrant`
 
@@ -251,7 +295,7 @@ IBlieverMarket(qd.market).resolve(winningOutcome)
 
 ---
 
-### 4.6 `reset(questionId)`
+### 5.6 `reset(questionId)`
 
 **Access:** `EMERGENCY_ROLE` + `nonReentrant`  
 **Use case:** `priceDisputed` callback failed to fire (OO-side bug). Admin manually issues a fresh OO request.
@@ -266,7 +310,7 @@ _resetQuestion(msg.sender, questionId, true, qd)
 
 ---
 
-### 4.7 `_resetQuestion(requestor, questionId, resetRefund, qd)`
+### 5.7 `_resetQuestion(requestor, questionId, resetRefund, qd)`
 
 ```
 qd.requestTimestamp = uint40(block.timestamp)   // New OO anchor timestamp
@@ -276,11 +320,11 @@ _requestPrice(requestor, newTimestamp, qd.ancillaryData, …)
 emit QuestionReset
 ```
 
-**Critical:** `qd.requestTimestamp` must be updated before `_requestPrice()` is called. The OO identifies the request by `(requester, identifier, timestamp, ancillaryData)` — the new timestamp creates a distinct request key, not an update to the old one.
+**Critical:** `qd.requestTimestamp` must be updated before `_requestPrice()` is called. The OO identifies the request by `(requester, identifier, timestamp, ancillaryData)` — the new timestamp creates a distinct request key, not an update to the old one. `qd.ancillaryData` (which is fullAncillaryData) is reused unchanged across resets, keeping every OO request keyed to the same attributed data.
 
 ---
 
-### 4.8 `updateOptimisticOracle(newOracle)`
+### 5.8 `updateOptimisticOracle(newOracle)`
 
 **Access:** `DEFAULT_ADMIN_ROLE` + `nonReentrant`
 
@@ -292,7 +336,7 @@ Updates `optimisticOracle` storage slot. The `onlyOptimisticOracle` modifier rea
 
 ---
 
-## 5. `_hasPrice` and `_ready`
+## 6. `_hasPrice` and `_ready`
 
 ```solidity
 function _hasPrice(QuestionData storage qd) internal view returns (bool) {
@@ -300,7 +344,7 @@ function _hasPrice(QuestionData storage qd) internal view returns (bool) {
         address(this),
         MULTIPLE_VALUES_IDENTIFIER,
         qd.requestTimestamp,    // Uses the LATEST requestTimestamp (updated on reset)
-        qd.ancillaryData
+        qd.ancillaryData        // fullAncillaryData — matches the OO request key
     );
 }
 
@@ -317,7 +361,7 @@ function _ready(QuestionData storage qd) internal view returns (bool) {
 
 ---
 
-## 6. Role Enforcement — Modifier Summary
+## 7. Role Enforcement — Modifier Summary
 
 | Modifier | Enforced by | Applied on |
 |---|---|---|
@@ -330,7 +374,7 @@ function _ready(QuestionData storage qd) internal view returns (bool) {
 
 ---
 
-## 7. UUPS Upgrade Notes
+## 8. UUPS Upgrade Notes
 
 `_authorizeUpgrade(newImplementation)` is gated by `DEFAULT_ADMIN_ROLE`.
 
@@ -345,7 +389,7 @@ function _ready(QuestionData storage qd) internal view returns (bool) {
 
 ---
 
-## 8. Integration Notes for the MarketFactory
+## 9. Integration Notes for the MarketFactory
 
 The factory's `deployMarket()` transaction must:
 
@@ -354,7 +398,24 @@ The factory's `deployMarket()` transaction must:
 3. Call `adapter.initializeQuestion(questionId, market, ancillaryData, rewardToken, reward, bond, liveness)`.
    - Factory must pre-approve `adapter` as spender for `reward` amount of `rewardToken`.
 
-The `questionId` passed to both `market.initialize` and `adapter.initializeQuestion` **must** equal `keccak256(ancillaryData)`. This is validated on-chain in `initializeQuestion`.
+The `questionId` passed to both `market.initialize` and `adapter.initializeQuestion` **must** equal `keccak256(fullAncillaryData)`, where:
+
+```
+fullAncillaryData = abi.encodePacked(ancillaryData, ",initializer:", hexAddress(factoryAddress))
+```
+
+`AncillaryDataLib._appendAncillaryData` performs this concatenation on-chain inside `initializeQuestion`. The factory must replicate the same operation off-chain to pre-compute a matching `questionId`.
+
+**Off-chain computation (TypeScript / ethers.js):**
+```typescript
+const rawJson       = ethers.utils.toUtf8Bytes(jsonString);
+const suffix        = ethers.utils.toUtf8Bytes(",initializer:" + factoryAddress.slice(2).toLowerCase());
+const fullData      = ethers.utils.concat([rawJson, suffix]);
+const questionId    = ethers.utils.keccak256(fullData);
+```
+
+The raw `ancillaryData` length must be ≤ `MAX_ANCILLARY_DATA − INITIALIZER_SUFFIX_LENGTH` (8086 bytes).  
+`initializeQuestion` will revert with `InvalidAncillaryData` if this is exceeded.
 
 ### Resolving a market (post-event):
 
@@ -376,13 +437,14 @@ factory.callExpireUnresolved(marketAddress);
 
 ---
 
-## 9. Key Error Conditions and Debug Guide
+## 10. Key Error Conditions and Debug Guide
 
 | Error | Cause | Fix |
 |---|---|---|
-| `QuestionIdMismatch` | `keccak256(ancillaryData) != questionId` in `initializeQuestion` | Recompute questionId off-chain from exact ancillaryData bytes |
+| `QuestionIdMismatch` | `keccak256(fullAncillaryData) != questionId` in `initializeQuestion` | Recompute questionId off-chain from fullAncillaryData (raw JSON ++ `",initializer:"` ++ lower-case hex factory address) |
 | `QuestionIdMismatch` | `market.questionId() != questionId` | Market was initialized with wrong questionId; redeploy |
 | `AlreadyInitialized` | `initializeQuestion` called twice for same questionId | Check `isInitialized(questionId)` before calling |
+| `InvalidAncillaryData` | `ancillaryData.length == 0` or raw length > `MAX_ANCILLARY_DATA − INITIALIZER_SUFFIX_LENGTH` (8086 bytes) | Shorten the raw JSON; the 53-byte initializer suffix is appended on-chain |
 | `InvalidOutcomeCount` | `market.outcomeCount() > 7` | V1 cap; use outcomeCount ∈ [2, 7] |
 | `PriceNotAvailable` | `resolve()` called before liveness window closed | Check `ready(questionId)` first; poll until true |
 | `NotOptimisticOracle` | `priceDisputed` called by wrong address | OO address mismatch; check `optimisticOracle()` on adapter |
@@ -393,9 +455,9 @@ factory.callExpireUnresolved(marketAddress);
 
 ---
 
-## 10. Gas Notes
+## 11. Gas Notes
 
-- `initializeQuestion` is the most gas-intensive call: writes 6+ storage slots + 3–5 OO external calls. Expected ~250k–300k gas on Base.
+- `initializeQuestion` is the most gas-intensive call: appends initializer suffix (pure computation, ~2k gas), writes 6+ storage slots, + 3–5 OO external calls. Expected ~250k–300k gas on Base.
 - `resolve()` (fast path, no dispute): ~80k–120k gas. `settleAndGetPrice` + `decodeWinningOutcome` (pure math) + `market.resolve()` (1 SSTORE resolved + pool.settleMarket).
 - `priceDisputed` callback: ~60k gas. Two SSTOREs + one new OO request.
 - `postUpdate` (BulletinBoard): ~25k gas (one SSTORE for the new array element).
