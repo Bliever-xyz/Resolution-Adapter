@@ -94,7 +94,8 @@ The adapter calls `MultiValueDecoder.decodeWinningOutcome()` to extract the inde
 ┌─────────────────────────────────────────────────────────────────────┐
 │ Phase 1 — INITIALIZATION                                            │
 │   Factory calls initializeQuestion(questionId, market, ancData, …) │
-│   Adapter → OO.requestPrice(MULTIPLE_VALUES, …)                     │
+│   Adapter → AncillaryDataLib.append(factory, ancData) → fullData   │
+│   Adapter → OO.requestPrice(MULTIPLE_VALUES, fullData, …)          │
 │   Adapter → OO.setEventBased(…)                                     │
 │   Adapter → OO.setCallbacks(…, disputeCallback=true, …)            │
 │   Adapter → OO.setBond / setCustomLiveness (if overrides provided) │
@@ -166,7 +167,9 @@ Prediction markets frequently have ambiguous resolution criteria. Example: "Will
 - UMA DVM voters are bound to consider updates from the **question creator's address**.
 - Zero impact on the trading or resolution hot paths — `postUpdate()` is never called in normal settlement.
 
-This pattern has been proven in production on Polymarket's millions of markets. Adding it now costs almost nothing; removing it later would require an upgrade.
+`AncillaryDataLib` (also Polymarket-sourced) complements this by embedding the factory address directly inside the ancillary data submitted to UMA. DVM voters see `,initializer:0xFactory…` in every request, unambiguously attributing the market to the Bliever factory rather than an anonymous address.
+
+Both patterns have been proven in production on Polymarket's millions of markets. Adding them costs almost nothing; removing either later would require an upgrade.
 
 ---
 
@@ -200,7 +203,7 @@ The adapter is a **UUPS proxy**. The upgrade mechanism is:
 | Malicious OO callback | `onlyOptimisticOracle` modifier on `priceDisputed()`; checks current `optimisticOracle` address |
 | Duplicate resolution | `qd.resolved` flag checked first in `resolve()` and `resolveManually()` |
 | Admin governance attack (flag + resolveManually with wrong outcome) | 1-hour SAFETY_PERIOD public delay; community can contest; upgrade path is also gated by timelock |
-| questionId collision / mismatch | `keccak256(ancillaryData) == questionId` AND `market.questionId() == questionId` both verified in `initializeQuestion()` |
+| questionId collision / mismatch | `keccak256(fullAncillaryData) == questionId` AND `market.questionId() == questionId` both verified in `initializeQuestion()`; `fullAncillaryData` is computed on-chain by `AncillaryDataLib._appendAncillaryData` |
 | Oracle encoding exploit (crafted int256) | `MultiValueDecoder.decodeWinningOutcome()` enforces: top bits = 0, trailing slots = 0, exactly one slot = 1, all others = 0; reverts otherwise |
 | OO version upgrade breaking historical requests | Historical requests retain their `requestTimestamp` key; only NEW requests use the updated OO address |
 | Reward token stuck in adapter | `_refund()` triggered on `qd.refund == true` in both `_decodeAndResolve()` and `resolveManually()` |
