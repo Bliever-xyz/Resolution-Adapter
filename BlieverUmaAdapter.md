@@ -42,13 +42,15 @@ The adapter is the **sole bridge between the UMA oracle network and the BlieverM
 
 The adapter does **not** hold USDC, track shares, maintain liability counters, or own any AMM state. All of that lives in `BlieverV1Pool` and `BlieverMarket`. The adapter only stores oracle-coordination state — `QuestionData` — per registered question.
 
-### 2.2 Modular Oracle Coupling
+### 2.2 Modular Oracle Coupling — Per-Question Oracle Tracking
 
-The adapter treats the UMA oracle as a pluggable dependency. The `optimisticOracle` address can be updated by governance without touching any market contract. When UMA ships a new oracle version:
+The adapter treats the UMA oracle as a pluggable dependency. The `optimisticOracle` global address can be updated by governance without touching any market contract. When UMA ships a new oracle version:
 
 1. `DEFAULT_ADMIN_ROLE` calls `updateOptimisticOracle(newOO)` on the adapter proxy.
-2. All new questions use the new oracle. Already-settled questions are unaffected.
-3. Zero market migrations, zero re-deployments.
+2. All new questions use the new oracle. Their `_questionOracle` snapshot is recorded at `initializeQuestion` time and routes their `hasPrice` and `settleAndGetPrice` calls to `newOO`.
+3. Already-initialized questions are unaffected. Each question stores a `_questionOracle` snapshot pointing to the OO instance it was originally submitted to. Resolution calls for those questions continue routing to the original OO, not `newOO`.
+4. `priceDisputed` callbacks from the old OO are accepted via the `_knownOracles` registry, which records every OO address ever assigned to the adapter. The `onlyOptimisticOracle` modifier checks this registry rather than comparing against the single current OO address.
+5. **Oracle upgrades are safe at any time, even while hundreds of live questions are in-flight.** No markets are bricked.
 
 This is the core justification for making the adapter an upgradeable UUPS proxy while keeping all markets as immutable EIP-1167 clones.
 
@@ -99,6 +101,7 @@ The adapter calls `MultiValueDecoder.decodeWinningOutcome()` to extract the inde
 │   Adapter → OO.setEventBased(…)                                     │
 │   Adapter → OO.setCallbacks(…, disputeCallback=true, …)            │
 │   Adapter → OO.setBond / setCustomLiveness (if overrides provided) │
+│   Adapter snapshots _questionOracle[questionId] = optimisticOracle  │
 └─────────────────────────────────────────────────────────────────────┘
                          │
                          ▼  (event happens in the real world)
@@ -112,6 +115,7 @@ The adapter calls `MultiValueDecoder.decodeWinningOutcome()` to extract the inde
 │   ┌──────────── First dispute ───────────────────────────────────┐  │
 │   │  OO calls adapter.priceDisputed() callback                  │  │
 │   │  Adapter issues fresh OO.requestPrice (new timestamp)        │  │
+│   │  Adapter re-snapshots _questionOracle for the new request    │  │
 │   │  Bot must propose again within the new liveness window       │  │
 │   └──────────────────────────────────────────────────────────────┘  │
 │   ┌──────────── Second dispute → DVM ───────────────────────────┐  │
@@ -125,11 +129,13 @@ The adapter calls `MultiValueDecoder.decodeWinningOutcome()` to extract the inde
 ┌─────────────────────────────────────────────────────────────────────┐
 │ Phase 3 — SETTLEMENT                                                │
 │   adapter.resolve(questionId):                                      │
-│     OO.settleAndGetPrice → int256 encodedPrice                      │
-│     int256.min?   → reset question (too early)                      │
+│     _questionOracle[questionId].settleAndGetPrice → int256          │
+│     int256.min + reward == 0 → reset question (too early)           │
+│     int256.min + reward  > 0 → flag for admin; reward was consumed  │
 │     int256.max?   → mark unresolvable; factory expires market       │
 │     valid price → decodeWinningOutcome → market.resolve(winner)     │
 │     market.resolve → pool.settleMarket(totalPayoutUsdc)             │
+│     _refund(qd) if applicable — AFTER market.resolve succeeds       │
 │     Winners call market.claim() → pool.claimWinnings()              │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -144,20 +150,33 @@ The adapter's emergency path allows the **EMERGENCY_ROLE** (protocol DAO multisi
 
 ```
 EMERGENCY_ROLE calls flag(questionId)
-  → qd.paused = true  (blocks permissionless resolve())
   → qd.manualResolveAt = now + 1 hour  (public 1-hour notice window)
+  → resolve() reverts with Flagged (independent of qd.paused)
 
 After 1 hour:
 EMERGENCY_ROLE calls resolveManually(questionId, correctWinner)
   → Bypasses OO entirely
   → Calls market.resolve(correctWinner) directly
+  → _refund(qd) if applicable — AFTER market.resolve succeeds
 ```
 
 The 1-hour delay is a deliberate transparency mechanism: it gives the community time to contest the admin's decision before it is irreversible. `unflag()` can cancel the intervention before the period ends.
 
+**Pause and flag are independent states.** `flag()` and `unflag()` operate only on `qd.manualResolveAt` and never touch `qd.paused`. A question explicitly paused via `pauseQuestion()` before or after a flag/unflag cycle retains its paused state exactly as set. There is no state-overwrite interaction between the two mechanisms.
+
 ---
 
-## 6. BulletinBoard — On-Chain Dispute Quality
+## 6. TOO_EARLY Recovery Path
+
+When UMA's event-based oracle receives a proposal before the event anchor timestamp, it settles with `type(int256).min` (TOO_EARLY_PRICE). The adapter's response branches on whether a reward was attached to the question:
+
+**`reward == 0` (common V1 case):** The adapter auto-resets — it issues a fresh OO price request with a new timestamp. No token transfer is involved so there is no balance risk.
+
+**`reward > 0`:** UMA consumes the reward token when settling a TOO_EARLY result. It does not refund it to the adapter. The adapter cannot safely self-fund a new request from a zero balance. Instead, the adapter sets `qd.manualResolveAt = now + SAFETY_PERIOD` and emits `QuestionFlagged`. EMERGENCY_ROLE then calls `reset(questionId)`, paying for the new OO request from their own balance, which also clears the flag atomically.
+
+---
+
+## 7. BulletinBoard — On-Chain Dispute Quality
 
 Prediction markets frequently have ambiguous resolution criteria. Example: "Will the US Federal Reserve cut rates by Q2 2026?" — what counts as a "cut"? 25 bps? 50 bps? An emergency cut?
 
@@ -173,7 +192,7 @@ Both patterns have been proven in production on Polymarket's millions of markets
 
 ---
 
-## 7. Access Control Matrix
+## 8. Access Control Matrix
 
 | Role | Who Holds It | Permissions |
 |---|---|---|
@@ -182,28 +201,32 @@ Both patterns have been proven in production on Polymarket's millions of markets
 | `EMERGENCY_ROLE` | Emergency multisig / DAO | `flag()`, `unflag()`, `resolveManually()`, `reset()`, `pauseQuestion()`, `unpauseQuestion()` |
 
 `resolve()` and `BulletinBoard.postUpdate()` are **permissionless** — any EOA can call them.  
-The OO callback `priceDisputed()` is gated by `onlyOptimisticOracle` (current OO address).
+The OO callback `priceDisputed()` is gated by `onlyOptimisticOracle` (any address in `_knownOracles`).
 
 ---
 
-## 8. Upgrade Model
+## 9. Upgrade Model
 
 The adapter is a **UUPS proxy**. The upgrade mechanism is:
 - `_authorizeUpgrade()` gated to `DEFAULT_ADMIN_ROLE` (governance multisig + timelock in production).
 - The stored `QuestionData` mapping persists across upgrades (storage layout is fixed by the `QuestionData` struct — do NOT reorder fields).
+- `_knownOracles` and `_questionOracle` mappings also persist and must not be relocated.
 - Individual `BlieverMarket` clones are immutable EIP-1167 — they will continue pointing to the same adapter proxy address, which seamlessly receives the upgraded logic.
 
 ---
 
-## 9. Security Considerations
+## 10. Security Considerations
 
 | Risk | Mitigation |
 |---|---|
 | Re-entrancy via `market.resolve()` | `ReentrancyGuardTransient` (EIP-1153) on all state-mutating external paths |
-| Malicious OO callback | `onlyOptimisticOracle` modifier on `priceDisputed()`; checks current `optimisticOracle` address |
+| Malicious OO callback | `onlyOptimisticOracle` modifier gates `priceDisputed()`; checks `_knownOracles[msg.sender]` — only addresses ever legitimately assigned as OO are accepted |
 | Duplicate resolution | `qd.resolved` flag checked first in `resolve()` and `resolveManually()` |
 | Admin governance attack (flag + resolveManually with wrong outcome) | 1-hour SAFETY_PERIOD public delay; community can contest; upgrade path is also gated by timelock |
 | questionId collision / mismatch | `keccak256(fullAncillaryData) == questionId` AND `market.questionId() == questionId` both verified in `initializeQuestion()`; `fullAncillaryData` is computed on-chain by `AncillaryDataLib._appendAncillaryData` |
 | Oracle encoding exploit (crafted int256) | `MultiValueDecoder.decodeWinningOutcome()` enforces: top bits = 0, trailing slots = 0, exactly one slot = 1, all others = 0; reverts otherwise |
-| OO version upgrade breaking historical requests | Historical requests retain their `requestTimestamp` key; only NEW requests use the updated OO address |
-| Reward token stuck in adapter | `_refund()` triggered on `qd.refund == true` in both `_decodeAndResolve()` and `resolveManually()` |
+| OO version upgrade breaking historical requests | Each question's `_questionOracle` snapshot pins the OO it was submitted to. Upgrades never affect in-flight questions. `_knownOracles` ensures old-OO callbacks are still accepted. |
+| Reward token stuck in adapter | `_refund()` triggered on `qd.refund == true` in both `_decodeAndResolve()` and `resolveManually()`, always after `market.resolve()` succeeds |
+| Reward token blacklist blocking market settlement | `market.resolve()` executes before `_refund()` in both resolution paths. A stuck refund never prevents winners from claiming. |
+| TOO_EARLY with reward > 0 draining adapter | Adapter does not attempt self-funded reset when `reward > 0`. Sets `manualResolveAt` and flags for admin recovery via `reset()`, which pulls fresh funds from EMERGENCY_ROLE. |
+| `unflag()` silently unpausing a `pauseQuestion()`-paused market | `flag()` and `unflag()` never touch `qd.paused`. The two states are fully orthogonal. `resolve()` checks both independently. |

@@ -58,7 +58,18 @@ Dynamic slot:
                               keccak256(ancillaryData) == questionId
 ```
 
-The `questions` mapping in `BlieverUmaAdapter` starts at storage slot determined by `AccessControlUpgradeable` + `PausableUpgradeable` + `UUPSUpgradeable` + `BulletinBoard` inheritance. The key point: `BulletinBoard.updates` occupies one mapping slot, and `optimisticOracle` + `questions` follow in declaration order.
+The `questions` mapping in `BlieverUmaAdapter` starts at storage slot determined by `AccessControlUpgradeable` + `PausableUpgradeable` + `UUPSUpgradeable` + `BulletinBoard` inheritance. The key point: `BulletinBoard.updates` occupies one mapping slot, and `optimisticOracle`, `questions`, `_knownOracles`, and `_questionOracle` follow in declaration order.
+
+### Additional Storage — Oracle Tracking
+
+```
+mapping(address => bool)                 _knownOracles     (private)
+mapping(bytes32 => IOptimisticOracleV2)  _questionOracle   (private)
+```
+
+`_knownOracles` records every OO address ever assigned to this adapter. Used by the `onlyOptimisticOracle` modifier to accept `priceDisputed` callbacks from any historically valid oracle, not only the current one.
+
+`_questionOracle` records the OO instance active at the time each question was initialized or last reset. All `hasPrice` and `settleAndGetPrice` calls for a given question route to this address, isolating resolution from any subsequent `updateOptimisticOracle` call.
 
 ---
 
@@ -91,7 +102,7 @@ The `questions` mapping in `BlieverUmaAdapter` starts at storage slot determined
 
 **Critical order of checks in `_decodeAndResolve`:**
 ```solidity
-if (MultiValueDecoder.isTooEarly(encodedPrice))   → _resetQuestion
+if (MultiValueDecoder.isTooEarly(encodedPrice))     → branch on reward (reset or flag)
 if (MultiValueDecoder.isUnresolvable(encodedPrice)) → mark unresolvable
 // Only THEN call decodeWinningOutcome — sentinels are excluded
 ```
@@ -155,6 +166,7 @@ Storage: one mapping `updates[keccak256(abi.encode(questionID, poster))] → Anc
 - Calls `__AccessControl_init()`, `__Pausable_init()`, `__UUPSUpgradeable_init()`.
 - Grants `DEFAULT_ADMIN_ROLE`, `FACTORY_ROLE`, `EMERGENCY_ROLE` to the provided addresses.
 - Sets `optimisticOracle` storage slot.
+- Registers the initial oracle in `_knownOracles[_optimisticOracle] = true`.
 - `_disableInitializers()` in the constructor prevents the implementation contract from being initialized directly.
 
 ---
@@ -180,7 +192,8 @@ market.outcomeCount() ∈ [2, MAX_OUTCOMES]        ← V1 cap
 1. Computes `fullAncillaryData = AncillaryDataLib._appendAncillaryData(msg.sender, ancillaryData)`,
    appending `,initializer:<lower-case-hex-address>` to attribute the market to its factory on the UMA DVM voter UI.
 2. Writes full `QuestionData` to `questions[questionId]` (single SSTORE batch), storing `fullAncillaryData`.
-3. Calls `_requestPrice(msg.sender, requestTimestamp, fullAncillaryData, …)` which:
+3. **Snapshots `_questionOracle[questionId] = optimisticOracle`** — pins this question to the current OO for all future `hasPrice` and `settleAndGetPrice` routing.
+4. Calls `_requestPrice(msg.sender, requestTimestamp, fullAncillaryData, …)` which:
    - Pulls `reward` from factory → adapter via `safeTransferFrom` if `reward > 0`.
    - Approves OO for `type(uint256).max` if current allowance < reward.
    - Calls `OO.requestPrice(MULTIPLE_VALUES, …)`.
@@ -198,22 +211,35 @@ market.outcomeCount() ∈ [2, MAX_OUTCOMES]        ← V1 cap
 
 **Guard checks (fast-revert order):**
 ```
-_isInitialized(qd)  → NotInitialized
-qd.paused           → QuestionIsPaused
-qd.resolved         → AlreadyResolved
-qd.unresolvable     → Unresolvable
-_hasPrice(qd)       → PriceNotAvailable
+_isInitialized(qd)   → NotInitialized
+qd.paused            → QuestionIsPaused
+_isFlagged(qd)       → Flagged          ← independent of qd.paused
+qd.resolved          → AlreadyResolved
+qd.unresolvable      → Unresolvable
+_hasPrice(questionId, qd) → PriceNotAvailable
 ```
+
+`_isFlagged` is checked independently of `qd.paused`. A question can be flagged without being paused, or paused without being flagged, and both checks gate the resolution path independently.
 
 Delegates to `_decodeAndResolve(questionId, qd)`.
 
 **`_decodeAndResolve` internals:**
 ```
-int256 encodedPrice = OO.settleAndGetPrice(MULTIPLE_VALUES, qd.requestTimestamp, qd.ancillaryData)
-// qd.ancillaryData is fullAncillaryData (raw JSON ++ initializer suffix) — matches the OO request key
+int256 encodedPrice = _questionOracle[questionId].settleAndGetPrice(
+    MULTIPLE_VALUES, qd.requestTimestamp, qd.ancillaryData
+)
+// Routes to the OO instance that holds the actual settled request,
+// not the current global optimisticOracle. Safe across oracle upgrades.
 
 if isTooEarly(encodedPrice):
-    _resetQuestion(address(this), questionId, true, qd)
+    if qd.reward > 0:
+        // OO consumed the reward on TOO_EARLY — adapter balance is 0.
+        // Self-funded reset would revert on safeTransferFrom(this, OO, reward).
+        qd.manualResolveAt = block.timestamp + SAFETY_PERIOD
+        emit QuestionFlagged
+    else:
+        // reward == 0: no token at risk. Auto-reset is safe.
+        _resetQuestion(address(this), questionId, true, qd)
     return
 
 if isUnresolvable(encodedPrice):
@@ -225,10 +251,15 @@ uint8 winner = decodeWinningOutcome(encodedPrice, qd.outcomeCount)
 
 // ── CEI: Effects ────────────────────────────────────────────────
 qd.resolved = true
-if qd.refund && qd.reward > 0: _refund(qd)          // ERC-20 transfer
 
-// ── Interaction ─────────────────────────────────────────────────
+// ── Critical interaction — must never be blocked ────────────────
 IBlieverMarket(qd.market).resolve(winner)
+// market.resolve executes FIRST so a stuck reward token transfer
+// (e.g. USDC blacklist on creator) cannot prevent market settlement.
+
+// ── Secondary interaction — best-effort after settlement ────────
+if qd.refund && qd.reward > 0: _refund(qd)
+
 emit QuestionResolved
 ```
 
@@ -241,7 +272,9 @@ emit QuestionResolved
 
 ### 5.4 `priceDisputed(identifier, timestamp, ancillaryData, refund)` — OO Callback
 
-**Access:** `onlyOptimisticOracle`
+**Access:** `onlyOptimisticOracle` (checks `_knownOracles[msg.sender]`)
+
+The modifier accepts callbacks from any OO ever assigned to this adapter, not only the current global `optimisticOracle`. This is required because a `priceDisputed` callback for a question initialized before an oracle upgrade will arrive from the old OO address, which is a known-but-no-longer-current oracle.
 
 ```
 // ancillaryData echoed by the OO is fullAncillaryData (raw JSON ++ initializer suffix)
@@ -270,43 +303,64 @@ _resetQuestion(address(this), questionId, false, qd)
 
 **`flag`:**
 ```
-check: initialized, not flagged, not resolved
+check: initialized, not already flagged, not resolved
 qd.manualResolveAt = block.timestamp + SAFETY_PERIOD
-qd.paused = true
+// NOTE: qd.paused is NOT touched. Flag and pause are orthogonal states.
+emit QuestionFlagged
 ```
 
 **`unflag`:**
 ```
 check: initialized, flagged, not resolved, block.timestamp < manualResolveAt
 qd.manualResolveAt = 0
-qd.paused = false
+// NOTE: qd.paused is NOT touched. A pauseQuestion() call before or after
+// flag/unflag is fully preserved. unflag() can never silently unpause a market.
+emit QuestionUnflagged
 ```
 
 **`resolveManually`:**
 ```
-check: initialized, flagged, not resolved, block.timestamp >= manualResolveAt
+check: initialized, flagged (manualResolveAt > 0), not resolved
+check: block.timestamp >= manualResolveAt
 check: winningOutcome < qd.outcomeCount
 
 // CEI
 qd.resolved = true
-if qd.refund && qd.reward > 0: _refund(qd)   // ERC-20 transfer
+
+// Critical interaction first — market settlement must not be blocked
 IBlieverMarket(qd.market).resolve(winningOutcome)
+
+// Secondary interaction — reward refund is best-effort after settlement
+if qd.refund && qd.reward > 0: _refund(qd)
+
+emit QuestionManuallyResolved(questionId, winningOutcome)
 ```
+
+`resolveManually` is reachable both from an admin-initiated `flag()` and from the automatic `TOO_EARLY + reward > 0` flag set by `_decodeAndResolve`. In both cases the guard conditions are identical: `_isFlagged(qd)` and `block.timestamp >= qd.manualResolveAt`.
 
 ---
 
 ### 5.6 `reset(questionId)`
 
 **Access:** `EMERGENCY_ROLE` + `nonReentrant`  
-**Use case:** `priceDisputed` callback failed to fire (OO-side bug). Admin manually issues a fresh OO request.
+**Use cases:**
+- `priceDisputed` callback failed to fire (OO-side bug). Admin manually issues a fresh OO request.
+- `TOO_EARLY + reward > 0` flagged the question. Admin funds a new OO request from their own balance.
 
 ```
 check: initialized, not resolved
 if qd.refund && qd.reward > 0: _refund(qd)
+
+// If flagged (e.g. from TOO_EARLY + reward > 0 path), clear the flag
+// before resetting so the fresh request can proceed normally.
+if _isFlagged(qd):
+    qd.manualResolveAt = 0
+    emit QuestionUnflagged
+
 _resetQuestion(msg.sender, questionId, true, qd)
 ```
 
-`msg.sender` (admin) pays for the new OO request reward, not `address(this)`.
+`msg.sender` (EMERGENCY_ROLE) pays for the new OO request reward, not `address(this)`. This is the safe recovery path when the adapter's token balance was consumed by a TOO_EARLY settlement.
 
 ---
 
@@ -316,11 +370,20 @@ _resetQuestion(msg.sender, questionId, true, qd)
 qd.requestTimestamp = uint40(block.timestamp)   // New OO anchor timestamp
 qd.reset = true
 if resetRefund: qd.refund = false
+
+// Re-snapshot the active oracle for this question's new request.
+// Future _hasPrice and settleAndGetPrice calls route to the current
+// global optimisticOracle, which may differ from the original if
+// updateOptimisticOracle was called between init and this reset.
+_questionOracle[questionId] = optimisticOracle
+
 _requestPrice(requestor, newTimestamp, qd.ancillaryData, …)
 emit QuestionReset
 ```
 
-**Critical:** `qd.requestTimestamp` must be updated before `_requestPrice()` is called. The OO identifies the request by `(requester, identifier, timestamp, ancillaryData)` — the new timestamp creates a distinct request key, not an update to the old one. `qd.ancillaryData` (which is fullAncillaryData) is reused unchanged across resets, keeping every OO request keyed to the same attributed data.
+**Critical:** `qd.requestTimestamp` must be updated before `_requestPrice()` is called. The OO identifies the request by `(requester, identifier, timestamp, ancillaryData)` — the new timestamp creates a distinct request key, not an update to the old one. `qd.ancillaryData` (fullAncillaryData) is reused unchanged across resets, keeping every OO request keyed to the same attributed data.
+
+After `_resetQuestion`, the question's `_questionOracle` snapshot points to the current global oracle. If the global oracle changed between this question's init and its first dispute, the reset correctly re-pins to the new oracle, and the old oracle's callback for the now-expired request is handled via `_knownOracles`.
 
 ---
 
@@ -328,19 +391,27 @@ emit QuestionReset
 
 **Access:** `DEFAULT_ADMIN_ROLE` + `nonReentrant`
 
-Updates `optimisticOracle` storage slot. The `onlyOptimisticOracle` modifier reads this slot live, so immediately after the update:
-- New `priceDisputed` callbacks are accepted from `newOracle` only.
-- Calls to `OO.settleAndGetPrice` in `resolve()` use `newOracle`.
+```
+if newOracle == address(0): revert ZeroAddress
+address oldOracle = address(optimisticOracle)
+optimisticOracle         = IOptimisticOracleV2(newOracle)
+_knownOracles[newOracle] = true
+emit OptimisticOracleUpdated(oldOracle, newOracle)
+```
 
-**Historical requests:** Questions already in the system store their `requestTimestamp` as the OO request key. If they need their historical request settled, they call the old OO's `settleAndGetPrice` via the *current adapter's `optimisticOracle` pointer* — which now points to `newOracle`. This means the caller needs to account for this if historical requests were made on the old OO. **Recommendation:** Do not update the OO address while there are unresolved questions. Use the upgrade to migrate to a new OO for new questions only, after all live questions have settled.
+After this call:
+- New `initializeQuestion` calls snapshot `_questionOracle[questionId] = newOracle`.
+- Existing questions retain their `_questionOracle` snapshot pointing to `oldOracle`. Their `hasPrice` and `settleAndGetPrice` calls continue routing to `oldOracle`.
+- `priceDisputed` callbacks from `oldOracle` continue to be accepted because `_knownOracles[oldOracle]` was set to `true` when `oldOracle` was originally assigned.
+- **This means there is no window during which an oracle upgrade can brick the resolution path for any live question.** The upgrade is safe at any time regardless of how many unresolved questions exist.
 
 ---
 
 ## 6. `_hasPrice` and `_ready`
 
 ```solidity
-function _hasPrice(QuestionData storage qd) internal view returns (bool) {
-    return optimisticOracle.hasPrice(
+function _hasPrice(bytes32 questionId, QuestionData storage qd) internal view returns (bool) {
+    return _questionOracle[questionId].hasPrice(
         address(this),
         MULTIPLE_VALUES_IDENTIFIER,
         qd.requestTimestamp,    // Uses the LATEST requestTimestamp (updated on reset)
@@ -348,16 +419,19 @@ function _hasPrice(QuestionData storage qd) internal view returns (bool) {
     );
 }
 
-function _ready(QuestionData storage qd) internal view returns (bool) {
-    return _isInitialized(qd)
-        && !qd.paused
-        && !qd.resolved
-        && !qd.unresolvable
-        && _hasPrice(qd);
+function _ready(bytes32 questionId, QuestionData storage qd) internal view returns (bool) {
+    if (!_isInitialized(qd)) return false;
+    if (qd.paused)           return false;
+    if (_isFlagged(qd))      return false;   // Flagged blocks ready() independently of paused
+    if (qd.resolved)         return false;
+    if (qd.unresolvable)     return false;
+    return _hasPrice(questionId, qd);
 }
 ```
 
-`_hasPrice` uses `qd.requestTimestamp` — after a `_resetQuestion`, the new timestamp is used, so `hasPrice` checks the reset request, not the original.
+Both functions take `questionId` as a parameter to look up `_questionOracle[questionId]`. Routing `hasPrice` through the per-question oracle snapshot instead of the global `optimisticOracle` ensures that `ready()` returns the correct answer even after an oracle upgrade.
+
+`_ready` checks `_isFlagged(qd)` as an independent gate. A question that is flagged but not paused, or paused but not flagged, is correctly gated in both cases.
 
 ---
 
@@ -368,7 +442,7 @@ function _ready(QuestionData storage qd) internal view returns (bool) {
 | `onlyRole(FACTORY_ROLE)` | OZ AccessControl | `initializeQuestion` |
 | `onlyRole(EMERGENCY_ROLE)` | OZ AccessControl | `flag`, `unflag`, `resolveManually`, `reset`, `pauseQuestion`, `unpauseQuestion` |
 | `onlyRole(DEFAULT_ADMIN_ROLE)` | OZ AccessControl | `pause`, `unpause`, `updateOptimisticOracle` |
-| `onlyOptimisticOracle` | `msg.sender == address(optimisticOracle)` | `priceDisputed` callback |
+| `onlyOptimisticOracle` | `_knownOracles[msg.sender]` | `priceDisputed` callback |
 | `whenNotPaused` | OZ Pausable | `initializeQuestion`, `resolve` |
 | `nonReentrant` | OZ ReentrancyGuardTransient (EIP-1153) | All state-mutating externals |
 
@@ -381,8 +455,7 @@ function _ready(QuestionData storage qd) internal view returns (bool) {
 **Storage invariants across upgrades:**
 - `QuestionData` struct field order must not change.
 - `BulletinBoard.updates` mapping slot must not change (inherited first in the linearization after Initializable).
-- `optimisticOracle` slot must not change.
-- `questions` mapping slot must not change.
+- `optimisticOracle`, `questions`, `_knownOracles`, and `_questionOracle` slots must not change.
 - Adding new storage variables is safe only by appending (do NOT insert between existing variables or inherited contracts).
 
 **Safe upgrade pattern:** Use OpenZeppelin's storage gap pattern (`uint256[50] private __gap`) in any new base contracts added in V2 to reserve future slots.
@@ -435,6 +508,14 @@ factory.callExpireUnresolved(marketAddress);
 // market.expireUnresolved() calls pool.settleMarket(0)
 ```
 
+### Checking the oracle instance for a question:
+
+```solidity
+address oo = adapter.getQuestionOracle(questionId);
+// Returns the OO instance this question's price request was submitted to.
+// Useful for direct OO inspection (e.g. checking bond amounts, dispute state).
+```
+
 ---
 
 ## 10. Key Error Conditions and Debug Guide
@@ -447,18 +528,21 @@ factory.callExpireUnresolved(marketAddress);
 | `InvalidAncillaryData` | `ancillaryData.length == 0` or raw length > `MAX_ANCILLARY_DATA − INITIALIZER_SUFFIX_LENGTH` (8086 bytes) | Shorten the raw JSON; the 53-byte initializer suffix is appended on-chain |
 | `InvalidOutcomeCount` | `market.outcomeCount() > 7` | V1 cap; use outcomeCount ∈ [2, 7] |
 | `PriceNotAvailable` | `resolve()` called before liveness window closed | Check `ready(questionId)` first; poll until true |
-| `NotOptimisticOracle` | `priceDisputed` called by wrong address | OO address mismatch; check `optimisticOracle()` on adapter |
+| `Flagged` | `resolve()` called while question is flagged for manual resolution | Wait for EMERGENCY_ROLE to call `resolveManually()`, or unflag if within safety period |
+| `NotOptimisticOracle` | `priceDisputed` called by an address not in `_knownOracles` | OO address was never registered; check `_knownOracles` via a fork test |
 | `InvalidOracleEncoding` | Oracle returned a price with multiple winners, a value > 1, or non-zero trailing bits | Review proposer bot encoding; ensure it uses `encodeValues([0,..,1,..,0])` |
 | `Unresolvable` | `resolve()` called after event was canceled (oracle returned int256.max) | Check `getQuestion(id).unresolvable`; trigger `factory.expireUnresolved()` |
 | `SafetyPeriodNotPassed` | `resolveManually` called too early | Wait until `block.timestamp >= getQuestion(id).manualResolveAt` |
-| `SafetyPeriodPassed` | `unflag()` called after the safety window closed | Cannot unflag; must proceed with `resolveManually` |
+| `SafetyPeriodPassed` | `unflag()` called after the safety window closed | Cannot unflag; must proceed with `resolveManually` or `reset` |
 
 ---
 
 ## 11. Gas Notes
 
-- `initializeQuestion` is the most gas-intensive call: appends initializer suffix (pure computation, ~2k gas), writes 6+ storage slots, + 3–5 OO external calls. Expected ~250k–300k gas on Base.
-- `resolve()` (fast path, no dispute): ~80k–120k gas. `settleAndGetPrice` + `decodeWinningOutcome` (pure math) + `market.resolve()` (1 SSTORE resolved + pool.settleMarket).
-- `priceDisputed` callback: ~60k gas. Two SSTOREs + one new OO request.
+- `initializeQuestion` is the most gas-intensive call: appends initializer suffix (pure computation, ~2k gas), writes 6+ storage slots + `_questionOracle` snapshot, + 3–5 OO external calls. Expected ~250k–310k gas on Base.
+- `resolve()` (fast path, no dispute): ~80k–130k gas. `_questionOracle` lookup (warm SLOAD) + `settleAndGetPrice` + `decodeWinningOutcome` (pure math) + `market.resolve()` (1 SSTORE resolved + pool.settleMarket).
+- `priceDisputed` callback: ~65k gas. Two SSTOREs + `_questionOracle` re-snapshot + one new OO request.
+- `_resetQuestion`: re-snapshots `_questionOracle[questionId] = optimisticOracle` — one warm SSTORE, negligible cost.
 - `postUpdate` (BulletinBoard): ~25k gas (one SSTORE for the new array element).
 - `ReentrancyGuardTransient` (EIP-1153): ~0 persistent gas overhead vs ~20k for the classic guard. Requires EIP-1153 support (Base supports this from genesis).
+- `onlyOptimisticOracle` modifier: uses `_knownOracles[msg.sender]` (one SLOAD) instead of a direct address comparison. Cost is identical on the hot path since the SLOAD is warm for the current OO after `updateOptimisticOracle`.
