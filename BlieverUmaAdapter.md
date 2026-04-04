@@ -135,7 +135,7 @@ The adapter calls `MultiValueDecoder.decodeWinningOutcome()` to extract the inde
 │     int256.max?   → mark unresolvable; factory expires market       │
 │     valid price → decodeWinningOutcome → market.resolve(winner)     │
 │     market.resolve → pool.settleMarket(totalPayoutUsdc)             │
-│     _refund(qd) if applicable — AFTER market.resolve succeeds       │
+│     _bestEffortRefund if applicable — non-reverting, after settle   │
 │     Winners call market.claim() → pool.claimWinnings()              │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -157,7 +157,7 @@ After 1 hour:
 EMERGENCY_ROLE calls resolveManually(questionId, correctWinner)
   → Bypasses OO entirely
   → Calls market.resolve(correctWinner) directly
-  → _refund(qd) if applicable — AFTER market.resolve succeeds
+  → _bestEffortRefund if applicable — non-reverting, after market.resolve()
 ```
 
 The 1-hour delay is a deliberate transparency mechanism: it gives the community time to contest the admin's decision before it is irreversible. `unflag()` can cancel the intervention before the period ends.
@@ -226,7 +226,8 @@ The adapter is a **UUPS proxy**. The upgrade mechanism is:
 | questionId collision / mismatch | `keccak256(fullAncillaryData) == questionId` AND `market.questionId() == questionId` both verified in `initializeQuestion()`; `fullAncillaryData` is computed on-chain by `AncillaryDataLib._appendAncillaryData` |
 | Oracle encoding exploit (crafted int256) | `MultiValueDecoder.decodeWinningOutcome()` enforces: top bits = 0, trailing slots = 0, exactly one slot = 1, all others = 0; reverts otherwise |
 | OO version upgrade breaking historical requests | Each question's `_questionOracle` snapshot pins the OO it was submitted to. Upgrades never affect in-flight questions. `_knownOracles` ensures old-OO callbacks are still accepted. |
-| Reward token stuck in adapter | `_refund()` triggered on `qd.refund == true` in both `_decodeAndResolve()` and `resolveManually()`, always after `market.resolve()` succeeds |
-| Reward token blacklist blocking market settlement | `market.resolve()` executes before `_refund()` in both resolution paths. A stuck refund never prevents winners from claiming. |
+| Reward token stuck in adapter | `_bestEffortRefund` emits `RefundFailed(questionId, creator, amount, token)` when transfer fails. Stranded tokens remain on the adapter; admins recover via event log and a future upgrade or rescue function. |
+| Reward token blacklist blocking market settlement | `market.resolve()` executes before `_bestEffortRefund()` in all settlement paths. A failed refund emits `RefundFailed` and never prevents winners from claiming. |
+| DVM escalation invisible to off-chain systems | `priceDisputed` emits `QuestionEscalatedToDVM(questionId)` on the second dispute. Indexers and monitoring bots listen for this event to detect the 48–96-hour DVM arbitration window without polling oracle state. |
 | TOO_EARLY with reward > 0 draining adapter | Adapter does not attempt self-funded reset when `reward > 0`. Sets `manualResolveAt` and flags for admin recovery via `reset()`, which pulls fresh funds from EMERGENCY_ROLE. |
 | `unflag()` silently unpausing a `pauseQuestion()`-paused market | `flag()` and `unflag()` never touch `qd.paused`. The two states are fully orthogonal. `resolve()` checks both independently. |

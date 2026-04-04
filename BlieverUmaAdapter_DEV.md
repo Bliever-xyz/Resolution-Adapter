@@ -17,12 +17,20 @@ contracts/src/
 ├── mixins/
 │   └── BulletinBoard.sol          ← On-chain update registry (Polymarket, unchanged)
 └── interfaces/
-    ├── IBlieverUmaAdapter.sol     ← Public interface + QuestionData struct
+    ├── IBlieverUmaAdapter.sol     ← Public interface + QuestionData struct  ⚠ see note
     ├── IBlieverMarket.sol         ← Minimal market interface (resolve, questionId, outcomeCount)
     ├── IOptimisticOracleV2.sol    ← Minimal UMA OO interface
     ├── IOptimisticRequester.sol   ← UMA callback interface
     └── IBulletinBoard.sol         ← BulletinBoard interface + AncillaryDataUpdate struct
 ```
+
+> **⚠ `IBlieverUmaAdapter.sol` requires an update.**  
+> `QuestionEscalatedToDVM` and `RefundFailed` are declared in `BlieverUmaAdapter.sol` directly (not in the interface) because they were introduced after the initial interface cut. They emit correctly on-chain in all cases. However, until they are added to `IBlieverUmaAdapter.sol`, external consumers that ABI-decode from the interface (SDKs, subgraphs, ethers.js `Contract` instances typed against the interface) will not see these events. Add both declarations to `IBlieverUmaAdapter.sol`:
+>
+> ```solidity
+> event QuestionEscalatedToDVM(bytes32 indexed questionId);
+> event RefundFailed(bytes32 indexed questionId, address indexed creator, uint256 amount, address indexed token);
+> ```
 
 ---
 
@@ -102,9 +110,11 @@ mapping(bytes32 => IOptimisticOracleV2)  _questionOracle   (private)
 
 **Critical order of checks in `_decodeAndResolve`:**
 ```solidity
-if (MultiValueDecoder.isTooEarly(encodedPrice))     → branch on reward (reset or flag)
-if (MultiValueDecoder.isUnresolvable(encodedPrice)) → mark unresolvable
-// Only THEN call decodeWinningOutcome — sentinels are excluded
+// using MultiValueDecoder for int256 — dot notation used throughout
+if (encodedPrice.isTooEarly())      → branch on reward (reset or flag)
+if (encodedPrice.isUnresolvable())  → mark unresolvable
+uint8 w = encodedPrice.decodeWinningOutcome(outcomeCount)
+// Sentinels are excluded before decoding per UMIP-183.
 ```
 Per UMIP-183: "to prevent misinterpretation prices should first be checked against the special values before decoding."
 
@@ -231,7 +241,7 @@ int256 encodedPrice = _questionOracle[questionId].settleAndGetPrice(
 // Routes to the OO instance that holds the actual settled request,
 // not the current global optimisticOracle. Safe across oracle upgrades.
 
-if isTooEarly(encodedPrice):
+if encodedPrice.isTooEarly():          // dot notation — using MultiValueDecoder for int256
     if qd.reward > 0:
         // OO consumed the reward on TOO_EARLY — adapter balance is 0.
         // Self-funded reset would revert on safeTransferFrom(this, OO, reward).
@@ -242,12 +252,12 @@ if isTooEarly(encodedPrice):
         _resetQuestion(address(this), questionId, true, qd)
     return
 
-if isUnresolvable(encodedPrice):
+if encodedPrice.isUnresolvable():      // dot notation
     qd.unresolvable = true
     emit QuestionUnresolvable
     return
 
-uint8 winner = decodeWinningOutcome(encodedPrice, qd.outcomeCount)
+uint8 winner = encodedPrice.decodeWinningOutcome(qd.outcomeCount)   // dot notation
 
 // ── CEI: Effects ────────────────────────────────────────────────
 qd.resolved = true
@@ -257,8 +267,10 @@ IBlieverMarket(qd.market).resolve(winner)
 // market.resolve executes FIRST so a stuck reward token transfer
 // (e.g. USDC blacklist on creator) cannot prevent market settlement.
 
-// ── Secondary interaction — best-effort after settlement ────────
-if qd.refund && qd.reward > 0: _refund(qd)
+// ── Secondary interaction — non-reverting best-effort refund ────
+if qd.refund && qd.reward > 0: _bestEffortRefund(questionId, qd)
+// Uses try/catch internally. On failure emits RefundFailed; market
+// settlement above is unaffected.
 
 emit QuestionResolved
 ```
@@ -282,11 +294,13 @@ bytes32 questionId = keccak256(ancillaryData)    // == keccak256(fullAncillaryDa
 QuestionData storage qd = questions[questionId]
 
 if qd.resolved:                    // Admin already resolved manually
-    transfer qd.reward to qd.creator
-    return
+    if qd.reward > 0:
+        _bestEffortRefund(questionId, qd)   // try/catch — cannot allow creator blacklist
+    return                                  // to revert the disputer's OO transaction
 
 if qd.reset:                       // Second dispute → DVM
     qd.refund = true
+    emit QuestionEscalatedToDVM(questionId)  // indexers/bots detect 48–96h DVM window
     return
 
 // First dispute → reset
@@ -330,8 +344,9 @@ qd.resolved = true
 // Critical interaction first — market settlement must not be blocked
 IBlieverMarket(qd.market).resolve(winningOutcome)
 
-// Secondary interaction — reward refund is best-effort after settlement
-if qd.refund && qd.reward > 0: _refund(qd)
+// Secondary interaction — non-reverting best-effort refund
+// try/catch internally; emits RefundFailed if creator cannot receive token.
+if qd.refund && qd.reward > 0: _bestEffortRefund(questionId, qd)
 
 emit QuestionManuallyResolved(questionId, winningOutcome)
 ```
@@ -387,7 +402,41 @@ After `_resetQuestion`, the question's `_questionOracle` snapshot points to the 
 
 ---
 
-### 5.8 `updateOptimisticOracle(newOracle)`
+### 5.8a `_bestEffortRefund(questionId, qd)` — Non-Reverting Reward Return
+
+Called from all settlement-critical paths: `_decodeAndResolve`, `resolveManually`, and the `qd.resolved` branch of `priceDisputed`.
+
+```
+uint256 amount = qd.reward
+qd.reward = 0                          // CEI: clear before external call
+try IERC20(qd.rewardToken).transfer(qd.creator, amount) {}
+catch {
+    emit RefundFailed(questionId, qd.creator, amount, qd.rewardToken)
+}
+```
+
+**Why raw `.transfer()` not `safeTransfer`:**  
+`safeTransfer` is injected by the `using SafeERC20 for IERC20` directive as an *internal* function. Solidity's `try/catch` only wraps genuine *external* ABI calls. Wrapping an internal library call in `try/catch` does not compile. The raw `IERC20.transfer()` is a proper external call on the token contract and can be wrapped. Since the `catch` block handles any revert, the return-value check that `safeTransfer` adds is redundant — both a `false` return and a revert are caught identically.
+
+**CEI note:** `qd.reward` is zeroed before the external `transfer`. This is belt-and-suspenders practice: `ReentrancyGuardTransient` and `qd.resolved = true` already block reentry on all calling paths, but clearing state before external calls is correct regardless.
+
+**Recovery:** If `catch` fires, tokens remain on the adapter. Admins locate the stuck amount via `RefundFailed` logs and recover via a future upgrade or dedicated rescue function.
+
+---
+
+### 5.8b `_refund(qd)` — Hard-Reverting Reward Return
+
+Called **only** from `reset()` — the admin failsafe path where the market is not yet settled and reverting is acceptable. If the creator cannot receive the token, the admin must address the root cause (e.g. token blacklist, pause) before retrying `reset()`.
+
+Do **not** call `_refund` from any settlement path. Use `_bestEffortRefund` instead.
+
+```
+IERC20(qd.rewardToken).safeTransfer(qd.creator, qd.reward)
+```
+
+---
+
+### 5.9 `updateOptimisticOracle(newOracle)`
 
 **Access:** `DEFAULT_ADMIN_ROLE` + `nonReentrant`
 
@@ -541,7 +590,9 @@ address oo = adapter.getQuestionOracle(questionId);
 
 - `initializeQuestion` is the most gas-intensive call: appends initializer suffix (pure computation, ~2k gas), writes 6+ storage slots + `_questionOracle` snapshot, + 3–5 OO external calls. Expected ~250k–310k gas on Base.
 - `resolve()` (fast path, no dispute): ~80k–130k gas. `_questionOracle` lookup (warm SLOAD) + `settleAndGetPrice` + `decodeWinningOutcome` (pure math) + `market.resolve()` (1 SSTORE resolved + pool.settleMarket).
-- `priceDisputed` callback: ~65k gas. Two SSTOREs + `_questionOracle` re-snapshot + one new OO request.
+- `priceDisputed` callback (first dispute): ~65k gas. Two SSTOREs + `_questionOracle` re-snapshot + one new OO request.
+- `priceDisputed` callback (second dispute → DVM): ~25k gas. One SSTORE (`qd.refund = true`) + one event (`QuestionEscalatedToDVM`). No new OO request.
+- `_bestEffortRefund` (success path): ~30k gas. One SSTORE (`qd.reward = 0`) + one external `transfer`. On failure: same SSTORE + one `RefundFailed` event (~3k gas for the log).
 - `_resetQuestion`: re-snapshots `_questionOracle[questionId] = optimisticOracle` — one warm SSTORE, negligible cost.
 - `postUpdate` (BulletinBoard): ~25k gas (one SSTORE for the new array element).
 - `ReentrancyGuardTransient` (EIP-1153): ~0 persistent gas overhead vs ~20k for the classic guard. Requires EIP-1153 support (Base supports this from genesis).
