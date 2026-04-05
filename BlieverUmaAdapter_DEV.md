@@ -226,10 +226,11 @@ qd.paused            → QuestionIsPaused
 _isFlagged(qd)       → Flagged          ← independent of qd.paused
 qd.resolved          → AlreadyResolved
 qd.unresolvable      → Unresolvable
-_hasPrice(questionId, qd) → PriceNotAvailable
 ```
 
 `_isFlagged` is checked independently of `qd.paused`. A question can be flagged without being paused, or paused without being flagged, and both checks gate the resolution path independently.
+
+`_hasPrice` is **not** called in `resolve()`. `settleAndGetPrice()` inside `_decodeAndResolve()` naturally reverts with the OO's own error if the liveness window has not closed. This eliminates a redundant external view call to the OO on every resolution. `ready()` remains the canonical off-chain / indexer signal for price availability.
 
 Delegates to `_decodeAndResolve(questionId, qd)`.
 
@@ -409,18 +410,24 @@ Called from all settlement-critical paths: `_decodeAndResolve`, `resolveManually
 ```
 uint256 amount = qd.reward
 qd.reward = 0                          // CEI: clear before external call
-try IERC20(qd.rewardToken).transfer(qd.creator, amount) {}
-catch {
+try IERC20(qd.rewardToken).transfer(qd.creator, amount) returns (bool success) {
+    if (!success) {
+        emit RefundFailed(questionId, qd.creator, amount, qd.rewardToken)
+    }
+} catch {
     emit RefundFailed(questionId, qd.creator, amount, qd.rewardToken)
 }
 ```
 
 **Why raw `.transfer()` not `safeTransfer`:**  
-`safeTransfer` is injected by the `using SafeERC20 for IERC20` directive as an *internal* function. Solidity's `try/catch` only wraps genuine *external* ABI calls. Wrapping an internal library call in `try/catch` does not compile. The raw `IERC20.transfer()` is a proper external call on the token contract and can be wrapped. Since the `catch` block handles any revert, the return-value check that `safeTransfer` adds is redundant — both a `false` return and a revert are caught identically.
+`safeTransfer` is injected by the `using SafeERC20 for IERC20` directive as an *internal* function. Solidity's `try/catch` only wraps genuine *external* ABI calls. Wrapping an internal library call in `try/catch` does not compile. The raw `IERC20.transfer()` is a proper external call on the token contract and can be wrapped.
+
+**Why the return bool is explicitly captured:**  
+ERC-20 is not uniform in its failure behaviour. Compliant tokens revert on failure, which lands in the `catch` block. Non-standard tokens (older or bespoke implementations) may return `false` without reverting. Without capturing the return value in the `returns (bool success)` clause, a `false` return would pass through the `try` block silently — the `catch` would not fire, no event would be emitted, and the stuck funds would be invisible to monitoring. Capturing and checking `success` ensures `RefundFailed` is emitted in both failure modes.
 
 **CEI note:** `qd.reward` is zeroed before the external `transfer`. This is belt-and-suspenders practice: `ReentrancyGuardTransient` and `qd.resolved = true` already block reentry on all calling paths, but clearing state before external calls is correct regardless.
 
-**Recovery:** If `catch` fires, tokens remain on the adapter. Admins locate the stuck amount via `RefundFailed` logs and recover via a future upgrade or dedicated rescue function.
+**Recovery:** If either failure path fires, tokens remain on the adapter. Admins locate the stuck amount via `RefundFailed` logs and recover via a future upgrade or dedicated rescue function.
 
 ---
 
@@ -576,7 +583,7 @@ address oo = adapter.getQuestionOracle(questionId);
 | `AlreadyInitialized` | `initializeQuestion` called twice for same questionId | Check `isInitialized(questionId)` before calling |
 | `InvalidAncillaryData` | `ancillaryData.length == 0` or raw length > `MAX_ANCILLARY_DATA − INITIALIZER_SUFFIX_LENGTH` (8086 bytes) | Shorten the raw JSON; the 53-byte initializer suffix is appended on-chain |
 | `InvalidOutcomeCount` | `market.outcomeCount() > 7` | V1 cap; use outcomeCount ∈ [2, 7] |
-| `PriceNotAvailable` | `resolve()` called before liveness window closed | Check `ready(questionId)` first; poll until true |
+| `PriceNotAvailable` | `resolve()` called before liveness window closed | Check `ready(questionId)` first; `resolve()` will propagate the OO's native revert if the price is not settled |
 | `Flagged` | `resolve()` called while question is flagged for manual resolution | Wait for EMERGENCY_ROLE to call `resolveManually()`, or unflag if within safety period |
 | `NotOptimisticOracle` | `priceDisputed` called by an address not in `_knownOracles` | OO address was never registered; check `_knownOracles` via a fork test |
 | `InvalidOracleEncoding` | Oracle returned a price with multiple winners, a value > 1, or non-zero trailing bits | Review proposer bot encoding; ensure it uses `encodeValues([0,..,1,..,0])` |
@@ -589,10 +596,10 @@ address oo = adapter.getQuestionOracle(questionId);
 ## 11. Gas Notes
 
 - `initializeQuestion` is the most gas-intensive call: appends initializer suffix (pure computation, ~2k gas), writes 6+ storage slots + `_questionOracle` snapshot, + 3–5 OO external calls. Expected ~250k–310k gas on Base.
-- `resolve()` (fast path, no dispute): ~80k–130k gas. `_questionOracle` lookup (warm SLOAD) + `settleAndGetPrice` + `decodeWinningOutcome` (pure math) + `market.resolve()` (1 SSTORE resolved + pool.settleMarket).
+- `resolve()` (fast path, no dispute): ~77k–127k gas. `_questionOracle` lookup (warm SLOAD) + `settleAndGetPrice` + `decodeWinningOutcome` (pure math) + `market.resolve()` (1 SSTORE resolved + pool.settleMarket). No `OO.hasPrice()` view call — removed as redundant.
 - `priceDisputed` callback (first dispute): ~65k gas. Two SSTOREs + `_questionOracle` re-snapshot + one new OO request.
 - `priceDisputed` callback (second dispute → DVM): ~25k gas. One SSTORE (`qd.refund = true`) + one event (`QuestionEscalatedToDVM`). No new OO request.
-- `_bestEffortRefund` (success path): ~30k gas. One SSTORE (`qd.reward = 0`) + one external `transfer`. On failure: same SSTORE + one `RefundFailed` event (~3k gas for the log).
+- `_bestEffortRefund` (success path): ~30k gas. One SSTORE (`qd.reward = 0`) + one external `transfer`. On non-reverting false return: same SSTORE + one `RefundFailed` event (~3k gas for the log). On hard revert (catch): same SSTORE + one `RefundFailed` event.
 - `_resetQuestion`: re-snapshots `_questionOracle[questionId] = optimisticOracle` — one warm SSTORE, negligible cost.
 - `postUpdate` (BulletinBoard): ~25k gas (one SSTORE for the new array element).
 - `ReentrancyGuardTransient` (EIP-1153): ~0 persistent gas overhead vs ~20k for the classic guard. Requires EIP-1153 support (Base supports this from genesis).
