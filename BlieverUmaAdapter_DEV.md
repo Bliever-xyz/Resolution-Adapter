@@ -31,6 +31,8 @@ contracts/src/
 > event QuestionEscalatedToDVM(bytes32 indexed questionId);
 > event RefundFailed(bytes32 indexed questionId, address indexed creator, uint256 amount, address indexed token);
 > ```
+>
+> `BlieverUmaAdapter__OnlySelf` is an implementation-internal error (not part of the public interface) and belongs only in `BlieverUmaAdapter.sol`. Do not add it to `IBlieverUmaAdapter.sol`.
 
 ---
 
@@ -294,6 +296,14 @@ The modifier accepts callbacks from any OO ever assigned to this adapter, not on
 bytes32 questionId = keccak256(ancillaryData)    // == keccak256(fullAncillaryData)
 QuestionData storage qd = questions[questionId]
 
+// ── Timestamp guard ──────────────────────────────────────────────────
+// The OO echoes back the timestamp that was set when the request was
+// submitted. After a first-dispute reset, qd.requestTimestamp is updated
+// to the new block.timestamp. A stale callback for the old timestamp
+// (e.g. delayed delivery, replayed message) must not trigger another
+// reset on the current request. Guard exits silently in that case.
+if (timestamp != qd.requestTimestamp) return
+
 if qd.resolved:                    // Admin already resolved manually
     if qd.reward > 0:
         _bestEffortRefund(questionId, qd)   // try/catch — cannot allow creator blacklist
@@ -304,11 +314,49 @@ if qd.reset:                       // Second dispute → DVM
     emit QuestionEscalatedToDVM(questionId)  // indexers/bots detect 48–96h DVM window
     return
 
-// First dispute → reset
-_resetQuestion(address(this), questionId, false, qd)
+// ── First dispute: attempt reset via external self-call ──────────────
+// _resetQuestion routes through _requestPrice which may revert if the
+// reward token is paused, the OO is paused by UMA governance, or any
+// other external call in the chain fails. If the revert propagated here,
+// the disputer's OO transaction would revert — permanently preventing
+// anyone from disputing the bad proposal and letting it finalize.
+//
+// try/catch guarantees the callback always lands. The catch block sets
+// manualResolveAt and emits QuestionFlagged, delegating recovery to
+// EMERGENCY_ROLE via reset(). The disputer's bond is posted regardless.
+//
+// _tryResetQuestion is external to satisfy Solidity's try/catch
+// requirement (only genuine external ABI calls can be wrapped).
+// It is access-guarded: msg.sender must be address(this).
+try this._tryResetQuestion(address(this), questionId, false) {
+    // Reset succeeded — new OO request issued with updated requestTimestamp.
+} catch {
+    // Reset failed — flag for EMERGENCY_ROLE recovery via reset().
+    qd.manualResolveAt = uint40(block.timestamp + SAFETY_PERIOD)
+    emit QuestionFlagged(questionId)
+}
 ```
 
 **Why `address(this)` pays for the reset:** On a first dispute, the reward already on the adapter is reused for the new OO request (the adapter is the `requestor`). On a second dispute (`qd.refund = true`), the reward is returned to the creator upon final resolution.
+
+---
+
+### 5.4a `_tryResetQuestion(requestor, questionId, resetRefund)` — External Self-Call Wrapper
+
+**Access:** `external` — only callable with `msg.sender == address(this)`, enforced by `BlieverUmaAdapter__OnlySelf`.
+
+```
+if msg.sender != address(this): revert BlieverUmaAdapter__OnlySelf()
+_resetQuestion(requestor, questionId, resetRefund, questions[questionId])
+```
+
+**Why external:** Solidity's `try/catch` mechanism only wraps genuine external ABI calls. Internal functions — including `_resetQuestion` — cannot be wrapped directly. Declaring `_tryResetQuestion` as `external` allows `priceDisputed` to use `try this._tryResetQuestion(...)`, creating a real ABI boundary that the EVM can catch across.
+
+**Why re-resolve the storage pointer:** Solidity prohibits passing `storage` pointers across external call frames. The function re-derives `questions[questionId]` from the mapping inside its own frame. This resolves to the same proxy storage slot as the pointer held by the caller — no data is copied, no slot is duplicated.
+
+**Why the access guard is mandatory:** `external` visibility makes the function callable by any address. Without the `msg.sender == address(this)` check, any actor could call `adapter._tryResetQuestion(attacker, victimQuestion, true)` at any time — forcing an unwanted reset, draining the reward balance to a different requestor, or flipping `qd.refund` incorrectly. The guard restricts valid callers to the adapter's own `try/catch` context exclusively.
+
+**Error:** `BlieverUmaAdapter__OnlySelf` — declared in `BlieverUmaAdapter.sol`, not in `IBlieverUmaAdapter.sol`. It is an implementation detail of the self-call pattern, not part of the public adapter interface.
 
 ---
 
@@ -499,6 +547,7 @@ Both functions take `questionId` as a parameter to look up `_questionOracle[ques
 | `onlyRole(EMERGENCY_ROLE)` | OZ AccessControl | `flag`, `unflag`, `resolveManually`, `reset`, `pauseQuestion`, `unpauseQuestion` |
 | `onlyRole(DEFAULT_ADMIN_ROLE)` | OZ AccessControl | `pause`, `unpause`, `updateOptimisticOracle` |
 | `onlyOptimisticOracle` | `_knownOracles[msg.sender]` | `priceDisputed` callback |
+| `msg.sender == address(this)` (inline guard) | `BlieverUmaAdapter__OnlySelf` custom error | `_tryResetQuestion` — external self-call wrapper only |
 | `whenNotPaused` | OZ Pausable | `initializeQuestion`, `resolve` |
 | `nonReentrant` | OZ ReentrancyGuardTransient (EIP-1153) | All state-mutating externals |
 
@@ -590,6 +639,8 @@ address oo = adapter.getQuestionOracle(questionId);
 | `Unresolvable` | `resolve()` called after event was canceled (oracle returned int256.max) | Check `getQuestion(id).unresolvable`; trigger `factory.expireUnresolved()` |
 | `SafetyPeriodNotPassed` | `resolveManually` called too early | Wait until `block.timestamp >= getQuestion(id).manualResolveAt` |
 | `SafetyPeriodPassed` | `unflag()` called after the safety window closed | Cannot unflag; must proceed with `resolveManually` or `reset` |
+| `BlieverUmaAdapter__OnlySelf` | `_tryResetQuestion` called by any address other than `address(this)` | This function is exclusively for internal self-call use inside `priceDisputed`'s try/catch. It must never be called directly from off-chain or by another contract. |
+| Silent no-op in `priceDisputed` (no state change, no event) | `timestamp != qd.requestTimestamp` — callback arrived for a superseded OO request | Expected behaviour for stale callbacks after a reset. The current request state is not affected; no action needed. |
 
 ---
 
@@ -597,8 +648,9 @@ address oo = adapter.getQuestionOracle(questionId);
 
 - `initializeQuestion` is the most gas-intensive call: appends initializer suffix (pure computation, ~2k gas), writes 6+ storage slots + `_questionOracle` snapshot, + 3–5 OO external calls. Expected ~250k–310k gas on Base.
 - `resolve()` (fast path, no dispute): ~77k–127k gas. `_questionOracle` lookup (warm SLOAD) + `settleAndGetPrice` + `decodeWinningOutcome` (pure math) + `market.resolve()` (1 SSTORE resolved + pool.settleMarket). No `OO.hasPrice()` view call — removed as redundant.
-- `priceDisputed` callback (first dispute): ~65k gas. Two SSTOREs + `_questionOracle` re-snapshot + one new OO request.
-- `priceDisputed` callback (second dispute → DVM): ~25k gas. One SSTORE (`qd.refund = true`) + one event (`QuestionEscalatedToDVM`). No new OO request.
+- `priceDisputed` callback (first dispute, reset succeeds): ~80k–90k gas. Timestamp guard (1 warm SLOAD, negligible). External self-call frame via `this._tryResetQuestion` adds one additional CALL opcode overhead (~700 gas base) plus the `msg.sender == address(this)` check (warm, negligible). Two SSTOREs + `_questionOracle` re-snapshot + one new OO request chain. The try/catch itself adds no gas beyond the CALL boundary cost when the call succeeds.
+- `priceDisputed` callback (first dispute, reset fails → catch): ~35k gas. Timestamp guard + resolved check + reset check + failed external call cost (reverted frame gas is mostly refunded) + one SSTORE (`qd.manualResolveAt`) + one event (`QuestionFlagged`).
+- `priceDisputed` callback (second dispute → DVM): ~25k gas. Timestamp guard + resolved check + one SSTORE (`qd.refund = true`) + one event (`QuestionEscalatedToDVM`). No new OO request.
 - `_bestEffortRefund` (success path): ~30k gas. One SSTORE (`qd.reward = 0`) + one external `transfer`. On non-reverting false return: same SSTORE + one `RefundFailed` event (~3k gas for the log). On hard revert (catch): same SSTORE + one `RefundFailed` event.
 - `_resetQuestion`: re-snapshots `_questionOracle[questionId] = optimisticOracle` — one warm SSTORE, negligible cost.
 - `postUpdate` (BulletinBoard): ~25k gas (one SSTORE for the new array element).

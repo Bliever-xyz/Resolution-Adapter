@@ -114,9 +114,10 @@ The adapter calls `MultiValueDecoder.decodeWinningOutcome()` to extract the inde
 │   └──────────────────────────────────────────────────────────────┘  │
 │   ┌──────────── First dispute ───────────────────────────────────┐  │
 │   │  OO calls adapter.priceDisputed() callback                  │  │
-│   │  Adapter issues fresh OO.requestPrice (new timestamp)        │  │
-│   │  Adapter re-snapshots _questionOracle for the new request    │  │
-│   │  Bot must propose again within the new liveness window       │  │
+│   │  Timestamp guard: stale callback? → silent return (no-op)   │  │
+│   │  try _tryResetQuestion → fresh OO request, new timestamp     │  │
+│   │    success: bot must propose again within new liveness       │  │
+│   │    catch:   flag for EMERGENCY_ROLE recovery via reset()     │  │
 │   └──────────────────────────────────────────────────────────────┘  │
 │   ┌──────────── Second dispute → DVM ───────────────────────────┐  │
 │   │  priceDisputed sets qd.refund = true, no new OO request     │  │
@@ -163,6 +164,20 @@ EMERGENCY_ROLE calls resolveManually(questionId, correctWinner)
 The 1-hour delay is a deliberate transparency mechanism: it gives the community time to contest the admin's decision before it is irreversible. `unflag()` can cancel the intervention before the period ends.
 
 **Pause and flag are independent states.** `flag()` and `unflag()` operate only on `qd.manualResolveAt` and never touch `qd.paused`. A question explicitly paused via `pauseQuestion()` before or after a flag/unflag cycle retains its paused state exactly as set. There is no state-overwrite interaction between the two mechanisms.
+
+---
+
+## 5a. Dispute Callback Resilience
+
+The `priceDisputed` callback is the only code path the adapter cannot initiate — it is driven entirely by the UMA OO calling back into the adapter when a disputer posts their bond. Two defensive mechanisms protect the integrity of this path.
+
+**Timestamp guard.** The OO echoes back the `timestamp` parameter that was originally set on the request. On a first dispute, the adapter already called `_resetQuestion`, which updates `qd.requestTimestamp` to a new value. If a delayed or replayed callback for the *old* request arrives afterward, the guard `if (timestamp != qd.requestTimestamp) return` exits silently. Without this guard, a late callback could trigger an erroneous second reset on a question whose new request is already in-flight.
+
+**Non-reverting reset via try/catch.** When `_resetQuestion` is called during a first dispute it routes through `_requestPrice`, which transfers tokens and calls the OO. Either of these external calls can revert — for example if the reward token is paused, or if the OO itself is temporarily paused by UMA governance. If `_resetQuestion` propagated a revert, the disputer's entire OO transaction would fail. The disputer would lose the ability to post their bond and the bad proposal would finalize unchallenged.
+
+The adapter instead wraps the reset in `try this._tryResetQuestion(...) { } catch { }`. If the reset reverts, the catch block sets `qd.manualResolveAt` and emits `QuestionFlagged`, exactly as the TOO_EARLY + reward > 0 path does. EMERGENCY_ROLE then calls `reset(questionId)` to issue a fresh OO request from its own balance. The disputer's transaction always lands; the market never gets locked by a reset failure.
+
+`_tryResetQuestion` is declared `external` solely to satisfy Solidity's constraint that `try/catch` only wraps genuine external ABI calls. It is access-guarded: `if (msg.sender != address(this)) revert BlieverUmaAdapter__OnlySelf()`. Only the adapter itself (via `this.X`) can invoke it.
 
 ---
 
@@ -231,3 +246,6 @@ The adapter is a **UUPS proxy**. The upgrade mechanism is:
 | DVM escalation invisible to off-chain systems | `priceDisputed` emits `QuestionEscalatedToDVM(questionId)` on the second dispute. Indexers and monitoring bots listen for this event to detect the 48–96-hour DVM arbitration window without polling oracle state. |
 | TOO_EARLY with reward > 0 draining adapter | Adapter does not attempt self-funded reset when `reward > 0`. Sets `manualResolveAt` and flags for admin recovery via `reset()`, which pulls fresh funds from EMERGENCY_ROLE. |
 | `unflag()` silently unpausing a `pauseQuestion()`-paused market | `flag()` and `unflag()` never touch `qd.paused`. The two states are fully orthogonal. `resolve()` checks both independently. |
+| Stale or replayed OO callback acting on superseded request state | `priceDisputed` guards `if (timestamp != qd.requestTimestamp) return` before any state change. A callback for an old request timestamp silently exits; the current request state is never corrupted. |
+| Reset failure in `priceDisputed` blocking dispute economics | `_resetQuestion` is wrapped in `try this._tryResetQuestion(...) catch`. If the reset reverts (e.g. token paused, OO paused), the catch flags the question for admin recovery instead of propagating the revert to the disputer's transaction. The disputer's OO call always lands. |
+| `_tryResetQuestion` called externally by an unauthorized address | `_tryResetQuestion` is declared `external` only to satisfy Solidity's try/catch requirement. It is access-guarded: `if (msg.sender != address(this)) revert BlieverUmaAdapter__OnlySelf()`. No external actor can invoke it. |
