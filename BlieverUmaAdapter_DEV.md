@@ -17,22 +17,12 @@ contracts/src/
 ├── mixins/
 │   └── BulletinBoard.sol          ← On-chain update registry (Polymarket, unchanged)
 └── interfaces/
-    ├── IBlieverUmaAdapter.sol     ← Public interface + QuestionData struct  ⚠ see note
+    ├── IBlieverUmaAdapter.sol     ← Public interface + QuestionData struct
     ├── IBlieverMarket.sol         ← Minimal market interface (resolve, questionId, outcomeCount)
     ├── IOptimisticOracleV2.sol    ← Minimal UMA OO interface
     ├── IOptimisticRequester.sol   ← UMA callback interface
     └── IBulletinBoard.sol         ← BulletinBoard interface + AncillaryDataUpdate struct
 ```
-
-> **⚠ `IBlieverUmaAdapter.sol` requires an update.**  
-> `QuestionEscalatedToDVM` and `RefundFailed` are declared in `BlieverUmaAdapter.sol` directly (not in the interface) because they were introduced after the initial interface cut. They emit correctly on-chain in all cases. However, until they are added to `IBlieverUmaAdapter.sol`, external consumers that ABI-decode from the interface (SDKs, subgraphs, ethers.js `Contract` instances typed against the interface) will not see these events. Add both declarations to `IBlieverUmaAdapter.sol`:
->
-> ```solidity
-> event QuestionEscalatedToDVM(bytes32 indexed questionId);
-> event RefundFailed(bytes32 indexed questionId, address indexed creator, uint256 amount, address indexed token);
-> ```
->
-> `BlieverUmaAdapter__OnlySelf` is an implementation-internal error (not part of the public interface) and belongs only in `BlieverUmaAdapter.sol`. Do not add it to `IBlieverUmaAdapter.sol`.
 
 ---
 
@@ -397,10 +387,13 @@ IBlieverMarket(qd.market).resolve(winningOutcome)
 // try/catch internally; emits RefundFailed if creator cannot receive token.
 if qd.refund && qd.reward > 0: _bestEffortRefund(questionId, qd)
 
-emit QuestionManuallyResolved(questionId, winningOutcome)
+// msg.sender is the EMERGENCY_ROLE holder — indexed as resolver for on-chain audit trail.
+emit QuestionManuallyResolved(questionId, winningOutcome, msg.sender)
 ```
 
 `resolveManually` is reachable both from an admin-initiated `flag()` and from the automatic `TOO_EARLY + reward > 0` flag set by `_decodeAndResolve`. In both cases the guard conditions are identical: `_isFlagged(qd)` and `block.timestamp >= qd.manualResolveAt`.
+
+The `resolver` field in `QuestionManuallyResolved` is `msg.sender` — the specific EMERGENCY_ROLE wallet that executed the call. Because `EMERGENCY_ROLE` may be held by multiple signers in a multisig, this indexed field creates an immutable on-chain record of exactly which address pulled the emergency lever, independently of any off-chain key management logs.
 
 ---
 
