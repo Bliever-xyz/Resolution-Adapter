@@ -159,6 +159,9 @@ EMERGENCY_ROLE calls resolveManually(questionId, correctWinner)
   → Bypasses OO entirely
   → Calls market.resolve(correctWinner) directly
   → _bestEffortRefund if applicable — non-reverting, after market.resolve()
+  → emits QuestionManuallyResolved(questionId, winningOutcome, msg.sender)
+     ↑ msg.sender is indexed as `resolver` — permanent on-chain record of
+       which admin wallet executed the emergency intervention
 ```
 
 The 1-hour delay is a deliberate transparency mechanism: it gives the community time to contest the admin's decision before it is irreversible. `unflag()` can cancel the intervention before the period ends.
@@ -237,7 +240,7 @@ The adapter is a **UUPS proxy**. The upgrade mechanism is:
 | Re-entrancy via `market.resolve()` | `ReentrancyGuardTransient` (EIP-1153) on all state-mutating external paths |
 | Malicious OO callback | `onlyOptimisticOracle` modifier gates `priceDisputed()`; checks `_knownOracles[msg.sender]` — only addresses ever legitimately assigned as OO are accepted |
 | Duplicate resolution | `qd.resolved` flag checked first in `resolve()` and `resolveManually()` |
-| Admin governance attack (flag + resolveManually with wrong outcome) | 1-hour SAFETY_PERIOD public delay; community can contest; upgrade path is also gated by timelock |
+| Admin governance attack (flag + resolveManually with wrong outcome) | 1-hour SAFETY_PERIOD public delay; community can contest; `QuestionManuallyResolved` indexes `resolver` (= `msg.sender`) providing an immutable on-chain record of which admin wallet acted; upgrade path is also gated by timelock |
 | questionId collision / mismatch | `keccak256(fullAncillaryData) == questionId` AND `market.questionId() == questionId` both verified in `initializeQuestion()`; `fullAncillaryData` is computed on-chain by `AncillaryDataLib._appendAncillaryData` |
 | Oracle encoding exploit (crafted int256) | `MultiValueDecoder.decodeWinningOutcome()` enforces: top bits = 0, trailing slots = 0, exactly one slot = 1, all others = 0; reverts otherwise |
 | OO version upgrade breaking historical requests | Each question's `_questionOracle` snapshot pins the OO it was submitted to. Upgrades never affect in-flight questions. `_knownOracles` ensures old-OO callbacks are still accepted. |
